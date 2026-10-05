@@ -17,7 +17,7 @@ import {
 import { socket } from '../lib/socket';
 import { playCountdownBeep, playBuzzerStrike } from '../lib/soundEngine';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+import { apiFetch } from '../lib/config';
 
 export default function BuzzerView() {
   const [team, setTeam] = useState(() => {
@@ -45,11 +45,18 @@ export default function BuzzerView() {
   const [activeStage, setActiveStage] = useState('WELCOME');
   const [score, setScore] = useState(team?.score || 0);
 
+  // Socket handlers read the latest state through refs so the listeners can
+  // stay registered for the whole session instead of re-binding on every change
+  const buzzerStateRef = useRef(buzzerState);
+  buzzerStateRef.current = buzzerState;
+  const latencyRef = useRef(0);
+  const evaluationResetTimer = useRef(null);
+
   // Ping Latency Timer
   useEffect(() => {
     const pingInterval = setInterval(() => {
       if (socket.connected) {
-        socket.emit('ping:measure', { sentAt: Date.now() });
+        socket.emit('ping:measure', { sentAt: Date.now(), latency: latencyRef.current });
       }
     }, 4000);
 
@@ -61,13 +68,7 @@ export default function BuzzerView() {
     function onConnect() {
       setConnected(true);
       if (team) {
-        socket.emit('join:room', {
-          role: 'team',
-          teamId: team.id,
-          teamNumber: team.teamNumber,
-          teamName: team.teamName,
-          sessionToken: localStorage.getItem('learnup_session_token')
-        });
+        socket.emit('join:room', { role: 'team', token: localStorage.getItem('learnup_token') });
       }
     }
 
@@ -77,7 +78,8 @@ export default function BuzzerView() {
 
     function onPongMeasure(data) {
       if (data?.sentAt) {
-        setLatency(Date.now() - data.sentAt);
+        latencyRef.current = Date.now() - data.sentAt;
+        setLatency(latencyRef.current);
       }
     }
 
@@ -120,10 +122,8 @@ export default function BuzzerView() {
         if ('vibrate' in navigator) {
           navigator.vibrate(80);
         }
-      } else {
-        if (buzzerState === 'UNLOCKED') {
-          setBuzzerState('WAITING');
-        }
+      } else if (buzzerStateRef.current === 'UNLOCKED') {
+        setBuzzerState('WAITING');
       }
     }
 
@@ -157,15 +157,28 @@ export default function BuzzerView() {
           setScore(found.score);
         }
       }
-      setTimeout(() => {
+      clearTimeout(evaluationResetTimer.current);
+      evaluationResetTimer.current = setTimeout(() => {
         setBuzzerState('WAITING');
         setBuzzerWinner(null);
       }, 2500);
     }
 
+    // This phone's session is no longer valid. Only clear local data: calling
+    // the logout API here would end the session of the phone that replaced us.
     function onSessionRevoked(data) {
       setSessionRevokedMsg(data?.message || 'Logged in on another device.');
-      handleLogout();
+      clearLocalSession();
+    }
+
+    function onBuzzerUnlocked() {
+      setBuzzerState('UNLOCKED');
+      setBuzzerWinner(null);
+    }
+
+    function onLeaderboardUpdate(teams) {
+      const found = teams?.find((t) => String(t._id || t.id) === String(team?.id));
+      if (found) setScore(found.score);
     }
 
     function onQuestionPresented() {
@@ -180,9 +193,9 @@ export default function BuzzerView() {
     socket.on('state:sync', onStateSync);
     socket.on('countdown:tick', onCountdownTick);
     socket.on('buzzer:status', onBuzzerStatus);
-    socket.on('buzzer:unlocked', () => setBuzzerState('UNLOCKED'));
+    socket.on('buzzer:unlocked', onBuzzerUnlocked);
     socket.on('buzzer:winner', onBuzzerWinner);
-    socket.on('buzzer:won', onBuzzerWinner);
+    socket.on('leaderboard:update', onLeaderboardUpdate);
     socket.on('buzzer:reset', onBuzzerReset);
     socket.on('question:presented', onQuestionPresented);
     socket.on('answer:evaluated', onAnswerEvaluated);
@@ -200,16 +213,16 @@ export default function BuzzerView() {
       socket.off('state:sync', onStateSync);
       socket.off('countdown:tick', onCountdownTick);
       socket.off('buzzer:status', onBuzzerStatus);
-      socket.off('buzzer:unlocked');
+      socket.off('buzzer:unlocked', onBuzzerUnlocked);
       socket.off('buzzer:winner', onBuzzerWinner);
-      socket.off('buzzer:won', onBuzzerWinner);
+      socket.off('leaderboard:update', onLeaderboardUpdate);
       socket.off('buzzer:reset', onBuzzerReset);
       socket.off('question:presented', onQuestionPresented);
       socket.off('answer:evaluated', onAnswerEvaluated);
       socket.off('auth:session_replaced', onSessionRevoked);
       socket.off('auth:session_revoked', onSessionRevoked);
     };
-  }, [team, buzzerState]);
+  }, [team]);
 
   // Handle Team Login
   const handleLogin = async (e) => {
@@ -219,18 +232,16 @@ export default function BuzzerView() {
     setLoginLoading(true);
 
     try {
-      const res = await fetch(`${API_URL}/api/v1/auth/team/login`, {
+      const { ok, json } = await apiFetch('/auth/team/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body: {
           teamNumber: Number(teamNumber),
           pin: pin.trim()
-        })
+        }
       });
 
-      const json = await res.json();
-      if (!res.ok || !json.success) {
-        throw new Error(json.error || 'Failed to authenticate team');
+      if (!ok || !json?.success) {
+        throw new Error(json?.error || 'Failed to authenticate team');
       }
 
       const teamData = json.data.team;
@@ -240,17 +251,10 @@ export default function BuzzerView() {
       localStorage.setItem('learnup_session_token', sessionToken);
       localStorage.setItem('learnup_token', json.data.token);
 
+      // Setting the team re-runs the socket effect, which joins the team room
       setTeam(teamData);
       setScore(teamData.score);
-
-      // Join socket room
-      socket.emit('join:room', {
-        role: 'team',
-        teamId: teamData.id,
-        teamNumber: teamData.teamNumber,
-        teamName: teamData.teamName,
-        sessionToken
-      });
+      if (!socket.connected) socket.connect();
     } catch (err) {
       setLoginError(err.message);
     } finally {
@@ -259,22 +263,19 @@ export default function BuzzerView() {
   };
 
   // Handle Logout
-  const handleLogout = async () => {
-    try {
-      if (team) {
-        await fetch(`${API_URL}/api/v1/auth/team/logout`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ teamId: team.id })
-        });
-      }
-    } catch (e) {}
-
+  function clearLocalSession() {
     localStorage.removeItem('learnup_team');
     localStorage.removeItem('learnup_session_token');
     localStorage.removeItem('learnup_token');
     setTeam(null);
     setBuzzerState('WAITING');
+  }
+
+  const handleLogout = async () => {
+    try {
+      await apiFetch('/auth/team/logout', { method: 'POST', token: localStorage.getItem('learnup_token') });
+    } catch (e) {}
+    clearLocalSession();
   };
 
   // Handle Buzzer Press
@@ -285,12 +286,8 @@ export default function BuzzerView() {
       navigator.vibrate(100);
     }
 
-    socket.emit('team:buzz', {
-      teamId: team.id,
-      teamNumber: team.teamNumber,
-      teamName: team.teamName,
-      timestamp: Date.now()
-    });
+    // The server identifies the team from this phone's verified session
+    socket.emit('team:buzz', { timestamp: Date.now() });
   };
 
   // -------------------------------------------------------------

@@ -26,4 +26,15 @@ cp .env.example .env
 npm run dev
 ```
 
-The frontend will run at `http://localhost:5173`.
+The frontend will run at `http://localhost:5173` and on the LAN at `http://<laptop-ip>:5173`.
+
+## Running the Live Event
+| Screen | URL | Notes |
+| :--- | :--- | :--- |
+| Admin | `/admin` | Log in with the backend's admin account. Refreshing restores the exact live state. |
+| Projector | `/projector` | Click **Enter Fullscreen Stage Mode** once (unlocks sound). The welcome screen shows a QR code with the join address. |
+| Team phones | `/buzzer` | Team number + PIN. One phone per team; logging in on another phone closes the first. |
+
+Admin hotkeys: **Space** reveal next option, **Enter** start 3-2-1 countdown, **Esc** reset buzzer (Round 1); **Z / X / C** correct / wrong / pass (Rapid Fire).
+
+If the projector page is opened on `localhost`, the QR code uses the laptop's LAN IP reported by the backend; check it matches the venue Wi-Fi address. The demo PIN list on the launchpad only appears on the dev server.

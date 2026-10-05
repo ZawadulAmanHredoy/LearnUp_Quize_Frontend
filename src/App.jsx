@@ -39,7 +39,9 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#0e0720] text-slate-100 flex flex-col font-sans">
-      {/* Quick Role Switcher Floating Bar */}
+      {/* Quick Role Switcher Floating Bar — hidden on the audience projector and
+          team phones, where it would be visible to the room / tempt a mis-tap */}
+      {(currentView === 'home' || currentView === 'admin') && (
       <nav className="fixed bottom-4 left-1/2 -translate-x-1/2 z-50 px-3 py-2 rounded-2xl bg-black/75 backdrop-blur-xl border border-white/15 shadow-2xl flex items-center gap-1.5 opacity-90 hover:opacity-100 transition-opacity">
         <button
           onClick={() => navigateTo('home')}
@@ -93,6 +95,7 @@ export default function App() {
           <span className="hidden sm:inline">Buzzer</span>
         </button>
       </nav>
+      )}
 
       {/* View Render */}
       {currentView === 'home' && <HomeLaunchpad onNavigate={navigateTo} />}

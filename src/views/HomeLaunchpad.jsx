@@ -16,7 +16,7 @@ import {
 } from 'lucide-react';
 import { socket } from '../lib/socket';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+import { apiFetch } from '../lib/config';
 
 export default function HomeLaunchpad({ onNavigate }) {
   const [serverOnline, setServerOnline] = useState(false);
@@ -25,20 +25,14 @@ export default function HomeLaunchpad({ onNavigate }) {
 
   useEffect(() => {
     // Check API health
-    fetch(`${API_URL}/api/v1/health`)
-      .then((res) => res.json())
-      .then((json) => {
-        if (json.status === 'success' || json.success) {
-          setServerOnline(true);
-        }
-      })
+    apiFetch('/health')
+      .then(({ json }) => setServerOnline(Boolean(json?.success)))
       .catch(() => setServerOnline(false));
 
-    // Fetch teams
-    fetch(`${API_URL}/api/v1/teams`)
-      .then((res) => res.json())
-      .then((json) => {
-        if (json.success && json.data) {
+    // Fetch teams (public listing: names and scores only)
+    apiFetch('/teams')
+      .then(({ json }) => {
+        if (json?.success && json.data) {
           setTeams(json.data);
         }
       })
@@ -250,7 +244,9 @@ export default function HomeLaunchpad({ onNavigate }) {
           </div>
         </div>
 
-        {/* Demo Credentials Roster Card */}
+        {/* Demo Credentials Roster Card — dev server only, so the seed PINs
+            are never on a page the audience can open during the event */}
+        {import.meta.env.DEV && (
         <div className="glass-panel p-6 rounded-3xl border border-white/10 space-y-4">
           <div className="flex items-center justify-between">
             <h4 className="text-sm font-bold text-white flex items-center gap-2">
@@ -280,6 +276,7 @@ export default function HomeLaunchpad({ onNavigate }) {
             ))}
           </div>
         </div>
+        )}
       </main>
 
       {/* Footer */}

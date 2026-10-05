@@ -32,7 +32,28 @@ import soundEngine, {
 } from '../lib/soundEngine';
 import { triggerConfetti } from '../lib/confetti';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+import QRCode from 'qrcode';
+import { apiFetch } from '../lib/config';
+
+function statsFromServer(stats) {
+  return {
+    correct: stats?.correct || 0,
+    wrong: stats?.wrong || 0,
+    pass: stats?.passed ?? stats?.pass ?? 0,
+    total: stats?.total ?? stats?.totalAsked ?? 0
+  };
+}
+
+/**
+ * Address phones should open. If the projector page itself was opened on
+ * localhost, swap in the laptop's LAN IP reported by the backend.
+ */
+function buildJoinUrl(lanAddresses = []) {
+  const { protocol, hostname, port } = window.location;
+  const isLocal = ['localhost', '127.0.0.1', '::1'].includes(hostname);
+  const host = isLocal && lanAddresses.length > 0 ? lanAddresses[0] : hostname;
+  return `${protocol}//${host}${port ? `:${port}` : ''}/buzzer`;
+}
 
 export default function ProjectorView() {
   const [hasStartedAudio, setHasStartedAudio] = useState(false);
@@ -84,6 +105,57 @@ export default function ProjectorView() {
   // Media Player Ref for AV Round
   const mediaRef = useRef(null);
 
+  // Score banner auto-hides so it never lingers into the next screen
+  const evaluationBannerTimer = useRef(null);
+  const clearBanners = () => {
+    clearTimeout(evaluationBannerTimer.current);
+    setBuzzerWinnerBanner(null);
+    setEvaluationBanner(null);
+  };
+
+  // Final ceremony (set by winner:celebration; detects a tie for first)
+  const [ceremony, setCeremony] = useState(null);
+
+  // Join QR code for team phones on the welcome screen
+  const [joinUrl, setJoinUrl] = useState('');
+  const [joinQr, setJoinQr] = useState('');
+
+  // Hide the mouse cursor after 3s of inactivity (stage mode)
+  const [isCursorHidden, setIsCursorHidden] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    apiFetch('/health')
+      .then(({ json }) => {
+        if (cancelled) return;
+        const url = buildJoinUrl(json?.data?.lanAddresses);
+        setJoinUrl(url);
+        return QRCode.toDataURL(url, { margin: 1, width: 360, color: { dark: '#1E143D', light: '#FFFFFF' } });
+      })
+      .then((dataUrl) => {
+        if (!cancelled && dataUrl) setJoinQr(dataUrl);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let timer = null;
+    const wake = () => {
+      setIsCursorHidden(false);
+      clearTimeout(timer);
+      timer = setTimeout(() => setIsCursorHidden(true), 3000);
+    };
+    wake();
+    window.addEventListener('mousemove', wake);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener('mousemove', wake);
+    };
+  }, []);
+
   // Initial Fetch & Socket Listeners
   useEffect(() => {
     // 1. Join room:projector
@@ -104,9 +176,22 @@ export default function ProjectorView() {
         if (data.state.questionSubState) setQuestionSubState(data.state.questionSubState);
         setQuestionIndex(data.state.currentQuestionIndex || 0);
         setActiveTeamId(data.state.activeTeamId || null);
+        if (data.state.currentStage !== 'FINAL_WINNER') setCeremony(null);
       }
-      if (data?.activeQuestion) {
-        setActiveQuestion(data.activeQuestion);
+      if (data && 'activeQuestion' in data) {
+        setActiveQuestion(data.activeQuestion || null);
+      }
+      if (data?.rapidFire) {
+        setRapidFireState({
+          isActive: Boolean(data.rapidFire.isActive),
+          secondsRemaining: data.rapidFire.timerSecondsRemaining ?? 60,
+          stats: statsFromServer({
+            correct: data.rapidFire.correctAnswersCount,
+            wrong: data.rapidFire.wrongAnswersCount,
+            passed: data.rapidFire.passedAnswersCount,
+            total: data.rapidFire.totalQuestionsAsked
+          })
+        });
       }
       if (data?.teams) {
         setTeams(data.teams);
@@ -116,11 +201,28 @@ export default function ProjectorView() {
     // 3. Stage Updates
     function onStageUpdated(data) {
       setCurrentStage(data.stage);
+      clearBanners();
+      setShowCountdownOverlay(false);
+      if (data.stage !== 'FINAL_WINNER') setCeremony(null);
       if (data.state?.breakConfig) setBreakConfig(data.state.breakConfig);
-      if (data.stage === 'FINAL_WINNER') {
+    }
+
+    // Final ceremony: fanfare for a champion, or a sudden-death call on a tie
+    function onWinnerCelebration(data) {
+      setCeremony(data);
+      if (data?.standings) setTeams(data.standings);
+      if (!data?.isTie) {
         playFanfare();
         triggerConfetti({ durationMs: 8000, particleCount: 200 });
       }
+    }
+
+    function onTurnUpdated(data) {
+      setActiveTeamId(data.activeTeamId || null);
+    }
+
+    function onQuestionShown(data) {
+      if (data?.questionSubState) setQuestionSubState(data.questionSubState);
     }
 
     // 4. Break Screen
@@ -145,9 +247,13 @@ export default function ProjectorView() {
         isEvaluated: false,
         isCorrect: null
       });
-      setBuzzerWinnerBanner(null);
-      setEvaluationBanner(null);
+      clearBanners();
       setShowCountdownOverlay(false);
+    }
+
+    function onBuzzerReset() {
+      setBuzzerWinnerBanner(null);
+      setQuestionSubState((prev) => ({ ...prev, buzzerLockedBy: null }));
     }
 
     // 6. Option Reveal
@@ -202,8 +308,13 @@ export default function ProjectorView() {
         isEvaluated: true,
         isCorrect: data.isCorrect
       }));
+      // The answer key is only sent to the stage once the question is evaluated
+      setActiveQuestion((prev) => (prev ? { ...prev, correctOptionIndex: data.correctOptionIndex } : prev));
 
+      setBuzzerWinnerBanner(null);
       setEvaluationBanner(data);
+      clearTimeout(evaluationBannerTimer.current);
+      evaluationBannerTimer.current = setTimeout(() => setEvaluationBanner(null), 6000);
 
       if (data.isCorrect) {
         playCorrect();
@@ -231,16 +342,23 @@ export default function ProjectorView() {
         mediaRef.current.play().catch(() => {});
       } else if (data.action === 'seek' && data.time !== undefined) {
         mediaRef.current.currentTime = data.time;
+      } else if (data.action === 'mute') {
+        mediaRef.current.muted = true;
+      } else if (data.action === 'unmute') {
+        mediaRef.current.muted = false;
       }
     }
 
     // 12. Rapid Fire Events
     function onRapidFireStarted(data) {
+      clearBanners();
       setRapidFireSummary(null);
+      setActiveTeamId(data.teamId || null);
+      setActiveQuestion(data.question || null);
       setRapidFireState({
         isActive: true,
         secondsRemaining: data.seconds || 60,
-        stats: { correct: 0, wrong: 0, pass: 0 }
+        stats: statsFromServer()
       });
     }
 
@@ -260,7 +378,7 @@ export default function ProjectorView() {
 
       setRapidFireState((prev) => ({
         ...prev,
-        stats: data.stats
+        stats: statsFromServer(data.stats)
       }));
       if (data.nextQuestion) {
         setActiveQuestion(data.nextQuestion);
@@ -273,7 +391,7 @@ export default function ProjectorView() {
     function onRapidFireTimesUp(data) {
       playTimesUp();
       setRapidFireState((prev) => ({ ...prev, isActive: false }));
-      setRapidFireSummary(data.stats);
+      setRapidFireSummary({ ...statsFromServer(data.stats), reason: data.reason });
     }
 
     // 13. Leaderboard Update
@@ -288,7 +406,10 @@ export default function ProjectorView() {
     socket.on('options:updated', onOptionsUpdated);
     socket.on('countdown:tick', onCountdownTick);
     socket.on('buzzer:winner', onBuzzerWinner);
-    socket.on('buzzer:won', onBuzzerWinner);
+    socket.on('winner:celebration', onWinnerCelebration);
+    socket.on('buzzer:reset', onBuzzerReset);
+    socket.on('turn:updated', onTurnUpdated);
+    socket.on('question:shown', onQuestionShown);
     socket.on('answer:locked', onAnswerLocked);
     socket.on('answer:evaluated', onAnswerEvaluated);
     socket.on('media:sync', onMediaSync);
@@ -307,7 +428,10 @@ export default function ProjectorView() {
       socket.off('options:updated', onOptionsUpdated);
       socket.off('countdown:tick', onCountdownTick);
       socket.off('buzzer:winner', onBuzzerWinner);
-      socket.off('buzzer:won', onBuzzerWinner);
+      socket.off('winner:celebration', onWinnerCelebration);
+      socket.off('buzzer:reset', onBuzzerReset);
+      socket.off('turn:updated', onTurnUpdated);
+      socket.off('question:shown', onQuestionShown);
       socket.off('answer:locked', onAnswerLocked);
       socket.off('answer:evaluated', onAnswerEvaluated);
       socket.off('media:sync', onMediaSync);
@@ -332,12 +456,13 @@ export default function ProjectorView() {
 
   // Find Leader Team
   const leaderTeam = teams && teams.length > 0 ? teams[0] : null;
+  const hasLeader = Boolean(leaderTeam && leaderTeam.score > 0 && leaderTeam.score > (teams[1]?.score ?? -Infinity));
 
   return (
     <div
       className={`min-h-screen w-full bg-[#160D2E] text-slate-100 flex flex-col justify-between overflow-hidden relative select-none ${
         isShaking ? 'animate-shake' : ''
-      }`}
+      } ${isCursorHidden && hasStartedAudio ? 'cursor-none' : ''}`}
     >
       {/* BACKGROUND AMBIENT GLOWS */}
       <div className="fixed inset-0 pointer-events-none overflow-hidden">
@@ -437,8 +562,10 @@ export default function ProjectorView() {
                 </span>
                 <h4 className="text-2xl sm:text-3xl font-bold font-heading">
                   {evaluationBanner.isCorrect
-                    ? `+${evaluationBanner.pointsAwarded || 10} Points Awarded to ${evaluationBanner.teamName || 'Team'}`
-                    : `${evaluationBanner.pointsAwarded || -5} Negative Penalty Applied to ${evaluationBanner.teamName || 'Team'}`}
+                    ? `+${evaluationBanner.pointsAwarded} Points Awarded to ${evaluationBanner.teamName || 'Team'}`
+                    : evaluationBanner.pointsAwarded < 0
+                    ? `${evaluationBanner.pointsAwarded} Penalty for ${evaluationBanner.teamName || 'Team'}`
+                    : `No points for ${evaluationBanner.teamName || 'Team'}`}
                 </h4>
               </div>
             </div>
@@ -479,7 +606,7 @@ export default function ProjectorView() {
 
         {/* Right: Clock & Leaderboard Snapshot */}
         <div className="flex items-center gap-4 text-xs font-medium">
-          {leaderTeam && (
+          {hasLeader && (
             <div className="px-4 py-2 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-300 flex items-center gap-2">
               <Trophy className="w-4 h-4 text-amber-400" />
               <span>Leader: <strong>{leaderTeam.teamName}</strong> ({leaderTeam.score} pts)</span>
@@ -501,7 +628,9 @@ export default function ProjectorView() {
         {/* STAGE: WELCOME & LANDING                                      */}
         {/* ============================================================= */}
         {currentStage === 'WELCOME' && (
-          <div className="text-center space-y-8 my-auto animate-pop">
+          // Keyed on the QR so the block remounts when it loads: content added
+          // into the finished pop animation was observed not to repaint
+          <div key={joinQr ? 'welcome-qr' : 'welcome'} className="text-center space-y-8 my-auto animate-pop">
             <div className="inline-flex items-center gap-2 px-5 py-2 rounded-full bg-[#10B981]/15 text-[#10B981] border border-[#10B981]/30 text-sm font-bold uppercase tracking-wider glow-mint">
               <Sparkles className="w-4 h-4" />
               Ready to Kickoff
@@ -517,6 +646,18 @@ export default function ProjectorView() {
                 Buzzer Battle • Audio-Visual Challenge • Rapid Fire
               </p>
             </div>
+
+            {/* Join QR Code for team phones */}
+            {joinQr && (
+              <div className="flex w-fit mx-auto items-center gap-6 p-5 rounded-3xl bg-[#1E143D] border border-white/15 text-left shadow-xl">
+                <img src={joinQr} alt="Scan to open the team buzzer" className="w-36 h-36 rounded-2xl bg-white p-1" />
+                <div className="space-y-1">
+                  <span className="text-xs uppercase tracking-widest text-[#10B981] font-bold block">Teams: scan to join</span>
+                  <span className="text-2xl font-bold text-white font-mono break-all">{joinUrl.replace(/^https?:\/\//, '')}</span>
+                  <span className="text-sm text-slate-400 block">Log in with your team number and PIN</span>
+                </div>
+              </div>
+            )}
 
             {/* Team Roster Badges */}
             <div className="pt-6 border-t border-white/10 max-w-4xl mx-auto">
@@ -725,7 +866,11 @@ export default function ProjectorView() {
 
                 {/* Media Presentation Display */}
                 {activeQuestion.mediaType === 'VIDEO' && activeQuestion.mediaUrl && (
-                  <div className="rounded-2xl overflow-hidden bg-black aspect-video max-h-[380px] mx-auto border border-white/20 shadow-2xl relative">
+                  <div
+                    className={`rounded-2xl overflow-hidden bg-black aspect-video mx-auto border border-white/20 shadow-2xl relative transition-all duration-500 ${
+                      questionSubState.isQuestionVisible ? 'max-h-[240px]' : 'max-h-[520px]'
+                    }`}
+                  >
                     <video
                       ref={mediaRef}
                       src={activeQuestion.mediaUrl}
@@ -747,9 +892,11 @@ export default function ProjectorView() {
                   </div>
                 )}
 
-                {/* Question Text */}
-                <div className="p-6 rounded-2xl bg-white/5 border border-white/15">
-                  <h2 className="projector-question-text font-bold text-white font-heading">
+                {/* Question Text (hidden while the media plays) */}
+                {questionSubState.isQuestionVisible ? (
+                <>
+                <div className="p-5 rounded-2xl bg-white/5 border border-white/15 animate-pop">
+                  <h2 className="text-3xl xl:text-4xl leading-tight font-bold text-white font-heading">
                     {activeQuestion.questionText}
                   </h2>
                 </div>
@@ -777,6 +924,12 @@ export default function ProjectorView() {
                     );
                   })}
                 </div>
+                </>
+                ) : (
+                  <div className="p-6 rounded-2xl bg-white/5 border border-white/10 text-center text-sky-200 font-bold uppercase tracking-widest text-sm">
+                    Watch &amp; listen closely — the question appears next
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -868,23 +1021,26 @@ export default function ProjectorView() {
                   ⏱️
                 </div>
                 <div className="space-y-2">
-                  <h3 className="text-4xl font-extrabold text-white font-heading">TIME'S UP!</h3>
-                  <p className="text-slate-300">60-Second Rapid Fire Slot Concluded</p>
+                  <h3 className="text-4xl font-extrabold text-white font-heading">
+                    {rapidFireSummary.reason === 'TIMES_UP' ? "TIME'S UP!" : 'SLOT ENDED'}
+                  </h3>
+                  <p className="text-slate-300">
+                    {teams.find((t) => String(t._id || t.id) === String(activeTeamId))?.teamName || 'Team'} — Rapid Fire Slot Concluded
+                  </p>
                 </div>
 
-                <div className="flex justify-center gap-6 pt-4 border-t border-white/10">
-                  <div className="px-6 py-4 rounded-2xl bg-white/5 border border-white/10">
-                    <span className="text-xs text-slate-400 uppercase">Correct Answers</span>
-                    <div className="text-3xl font-bold text-emerald-400 font-mono-numbers">
-                      {rapidFireSummary.correct}
+                <div className="flex flex-wrap justify-center gap-4 pt-4 border-t border-white/10">
+                  {[
+                    ['Total Answered', rapidFireSummary.total, 'text-white'],
+                    ['Correct', rapidFireSummary.correct, 'text-emerald-400'],
+                    ['Wrong', rapidFireSummary.wrong, 'text-rose-400'],
+                    ['Passed', rapidFireSummary.pass, 'text-slate-300']
+                  ].map(([label, value, color]) => (
+                    <div key={label} className="px-6 py-4 rounded-2xl bg-white/5 border border-white/10">
+                      <span className="text-xs text-slate-400 uppercase">{label}</span>
+                      <div className={`text-3xl font-bold font-mono-numbers ${color}`}>{value}</div>
                     </div>
-                  </div>
-                  <div className="px-6 py-4 rounded-2xl bg-white/5 border border-white/10">
-                    <span className="text-xs text-slate-400 uppercase">Total Questions</span>
-                    <div className="text-3xl font-bold text-white font-mono-numbers">
-                      {rapidFireSummary.totalAsked}
-                    </div>
-                  </div>
+                  ))}
                 </div>
               </div>
             ) : activeQuestion ? (
@@ -971,7 +1127,25 @@ export default function ProjectorView() {
         {/* ============================================================= */}
         {/* STAGE: FINAL WINNER CELEBRATION                               */}
         {/* ============================================================= */}
-        {currentStage === 'FINAL_WINNER' && (
+        {currentStage === 'FINAL_WINNER' && ceremony?.isTie && (
+          <div className="text-center space-y-8 my-auto animate-pop">
+            <div className="inline-flex items-center gap-2 px-6 py-2 rounded-full bg-rose-500/20 text-rose-300 border border-rose-400/50 text-sm font-bold uppercase tracking-widest glow-rose">
+              <Zap className="w-5 h-5" />
+              It's a tie at the top!
+            </div>
+            <h2 className="text-5xl sm:text-7xl font-black text-white font-heading tracking-tight">
+              SUDDEN DEATH
+            </h2>
+            <p className="text-2xl text-[#E0D7FE]">
+              {ceremony.tiedTeams.map((t) => t.teamName).join('  vs  ')}
+            </p>
+            <p className="text-lg text-amber-200 font-mono-numbers">
+              Tied on {ceremony.tiedTeams[0]?.score} points • One buzzer question decides the champion
+            </p>
+          </div>
+        )}
+
+        {currentStage === 'FINAL_WINNER' && !ceremony?.isTie && (
           <div className="text-center space-y-8 my-auto animate-pop">
             <div className="inline-flex items-center gap-2 px-6 py-2 rounded-full bg-gradient-to-r from-amber-500/30 to-yellow-500/20 text-amber-300 border border-amber-400/50 text-sm font-bold uppercase tracking-widest glow-gold animate-bounce">
               <Award className="w-5 h-5" />
@@ -984,11 +1158,11 @@ export default function ProjectorView() {
               </div>
 
               <h2 className="text-5xl sm:text-7xl font-black text-white font-heading tracking-tight">
-                {leaderTeam?.teamName || 'CHAMPION TEAM'}
+                {(ceremony?.champion || leaderTeam)?.teamName || 'CHAMPION TEAM'}
               </h2>
 
               <p className="text-2xl text-amber-200 font-mono-numbers">
-                Winning Score: {leaderTeam?.score || 0} Total Points
+                Winning Score: {(ceremony?.champion || leaderTeam)?.score || 0} Total Points
               </p>
             </div>
 

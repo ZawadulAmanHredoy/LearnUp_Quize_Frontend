@@ -38,7 +38,40 @@ import {
 } from 'lucide-react';
 import { socket } from '../lib/socket';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000';
+import { apiFetch } from '../lib/config';
+
+const EMPTY_QUESTION_SUB_STATE = {
+  isQuestionVisible: false,
+  revealedOptions: [],
+  areAllOptionsVisible: false,
+  isCountdownActive: false,
+  hasCountdownStarted: false,
+  isCountdownDone: false,
+  isBuzzerOpen: false,
+  buzzerLockedBy: null,
+  selectedOptionIndex: null,
+  isAnswerLocked: false,
+  isEvaluated: false,
+  isCorrect: null
+};
+
+const STAGE_TO_ROUND = {
+  ROUND_BUZZER: 'BUZZER',
+  ROUND_AV: 'AUDIO_VISUAL',
+  ROUND_RAPID_FIRE: 'RAPID_FIRE'
+};
+
+function rapidFireFromServer(rf) {
+  return {
+    isActive: Boolean(rf?.isActive),
+    secondsRemaining: rf?.timerSecondsRemaining ?? 60,
+    stats: {
+      correct: rf?.correctAnswersCount || 0,
+      wrong: rf?.wrongAnswersCount || 0,
+      pass: rf?.passedAnswersCount || 0
+    }
+  };
+}
 
 export default function AdminDashboard() {
   // -------------------------------------------------------------
@@ -131,26 +164,23 @@ export default function AdminDashboard() {
     setIsLoggingIn(true);
     setLoginError('');
     try {
-      const res = await fetch(`${API_URL}/api/v1/auth/admin/login`, {
+      const { json } = await apiFetch('/auth/admin/login', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body: {
           username: loginForm.username.trim(),
-          password: loginForm.password.trim()
-        })
+          password: loginForm.password
+        }
       });
-      const json = await res.json();
-      if (json.success && json.data?.token) {
+      if (json?.success && json.data?.token) {
         localStorage.setItem('admin_token', json.data.token);
         if (json.data.admin) {
           localStorage.setItem('admin_user', JSON.stringify(json.data.admin));
           setAdminUser(json.data.admin);
         }
+        setLoginForm((prev) => ({ ...prev, password: '' }));
         setIsAuthenticated(true);
-        loadInitialData();
-        socket.emit('join:room', { role: 'admin', token: json.data.token });
       } else {
-        setLoginError(json.error || json.message || 'Invalid credentials. Try admin / admin123');
+        setLoginError(json?.error || json?.message || 'Invalid credentials');
       }
     } catch (err) {
       setLoginError('Cannot connect to server. Ensure backend is running on port 5000.');
@@ -165,28 +195,52 @@ export default function AdminDashboard() {
     setIsAuthenticated(false);
   };
 
+  // Authenticated REST call; an expired or invalid token sends the host back to the login gate
+  const adminFetch = async (path, options = {}) => {
+    const result = await apiFetch(path, { ...options, token: localStorage.getItem('admin_token') });
+    if (result.status === 401) {
+      handleAdminLogout();
+      setLoginError('Session expired. Please log in again.');
+    }
+    return result;
+  };
+
+  const applySnapshot = (data) => {
+    if (!data) return;
+    const state = data.state;
+    if (state) {
+      setCurrentStage(state.currentStage || 'WELCOME');
+      if (STAGE_TO_ROUND[state.currentStage]) setActiveTab(state.currentStage);
+      setQuestionSubState({ ...EMPTY_QUESTION_SUB_STATE, ...(state.questionSubState || {}) });
+      if (typeof state.currentQuestionIndex === 'number') setCurrentQuestionIndex(state.currentQuestionIndex);
+      setAvActiveTeamId(state.activeTeamId || '');
+      if (state.rapidFireSubState) {
+        setRfState(rapidFireFromServer(state.rapidFireSubState));
+        if (state.rapidFireSubState.teamId) setRfTeamId(state.rapidFireSubState.teamId);
+      }
+    }
+    // Live in-memory timer beats the persisted copy
+    if (data.rapidFire) {
+      setRfState(rapidFireFromServer(data.rapidFire));
+      if (data.rapidFire.teamId) setRfTeamId(data.rapidFire.teamId);
+    }
+    if (data.teams) setTeams(data.teams);
+    if ('activeQuestion' in data) setActiveQuestion(data.activeQuestion || null);
+    if (data.radar) setRadar(data.radar);
+  };
+
   // -------------------------------------------------------------
   // INITIAL DATA FETCH
   // -------------------------------------------------------------
   const loadInitialData = async () => {
     try {
-      const resState = await fetch(`${API_URL}/api/v1/event/state`);
-      const jsonState = await resState.json();
-      if (jsonState.success && jsonState.data) {
-        setCurrentStage(jsonState.data.state?.currentStage || 'WELCOME');
-        setTeams(jsonState.data.teams || []);
-        if (jsonState.data.state?.questionSubState) {
-          setQuestionSubState(jsonState.data.state.questionSubState);
-        }
-      }
+      // Restore the exact live state (question, reveals, buzzer, scores) after a crash or refresh
+      const stateRes = await adminFetch('/event/state');
+      if (stateRes.json?.success) applySnapshot(stateRes.json.data);
 
-      const resQ = await fetch(`${API_URL}/api/v1/questions`);
-      const jsonQ = await resQ.json();
-      if (jsonQ.success && jsonQ.data) {
-        setQuestions(jsonQ.data);
-        if (jsonQ.data.length > 0) {
-          setActiveQuestion(jsonQ.data[0]);
-        }
+      const questionsRes = await adminFetch('/questions');
+      if (questionsRes.json?.success && Array.isArray(questionsRes.json.data)) {
+        setQuestions(questionsRes.json.data);
       }
     } catch (err) {
       console.error('Failed to load initial admin state:', err);
@@ -212,16 +266,39 @@ export default function AdminDashboard() {
     }
 
     function onStateSync(data) {
-      if (data?.state) {
-        setCurrentStage(data.state.currentStage);
-        if (data.state.questionSubState) setQuestionSubState(data.state.questionSubState);
-        if (typeof data.state.currentQuestionIndex === 'number') {
-          setCurrentQuestionIndex(data.state.currentQuestionIndex);
-        }
+      applySnapshot(data);
+    }
+
+    function onAuthError(data) {
+      if (data?.scope === 'admin') {
+        handleAdminLogout();
+        setLoginError(data.message || 'Please log in again.');
       }
-      if (data?.teams) setTeams(data.teams);
-      if (data?.activeQuestion) setActiveQuestion(data.activeQuestion);
-      if (data?.radar) setRadar(data.radar);
+    }
+
+    function onQuestionShown(data) {
+      if (data?.questionSubState) setQuestionSubState({ ...EMPTY_QUESTION_SUB_STATE, ...data.questionSubState });
+    }
+
+    function onTurnUpdated(data) {
+      setAvActiveTeamId(data.activeTeamId || '');
+    }
+
+    function onRapidFireStarted(data) {
+      setRfTeamId(data.teamId);
+      setRfState({
+        isActive: true,
+        secondsRemaining: data.seconds || 60,
+        stats: { correct: 0, wrong: 0, pass: 0 }
+      });
+      setActiveQuestion(data.question || null);
+    }
+
+    function onWinnerCelebration(data) {
+      if (data?.isTie) {
+        const names = data.tiedTeams.map((t) => t.teamName).join(' & ');
+        flashNotice(`Tie for first: ${names}. Run a sudden-death buzzer question.`, 8000);
+      }
     }
 
     function onStageUpdated(data) {
@@ -231,24 +308,7 @@ export default function AdminDashboard() {
     function onQuestionPresented(data) {
       if (data.question) setActiveQuestion(data.question);
       if (typeof data.questionIndex === 'number') setCurrentQuestionIndex(data.questionIndex);
-      if (data.questionSubState) {
-        setQuestionSubState(data.questionSubState);
-      } else {
-        setQuestionSubState({
-          isQuestionVisible: true,
-          revealedOptions: [],
-          areAllOptionsVisible: false,
-          isCountdownActive: false,
-          hasCountdownStarted: false,
-          isCountdownDone: false,
-          isBuzzerOpen: false,
-          buzzerLockedBy: null,
-          selectedOptionIndex: null,
-          isAnswerLocked: false,
-          isEvaluated: false,
-          isCorrect: null
-        });
-      }
+      setQuestionSubState({ ...EMPTY_QUESTION_SUB_STATE, ...(data.questionSubState || { isQuestionVisible: true }) });
     }
 
     function onOptionsUpdated(data) {
@@ -327,7 +387,7 @@ export default function AdminDashboard() {
     function onRapidFireUpdate(data) {
       setRfState((prev) => ({
         ...prev,
-        stats: data.stats
+        stats: { correct: data.stats.correct, wrong: data.stats.wrong, pass: data.stats.passed }
       }));
       if (data.nextQuestion) setActiveQuestion(data.nextQuestion);
       if (data.teams) setTeams(data.teams);
@@ -354,7 +414,11 @@ export default function AdminDashboard() {
     socket.on('buzzer:status', onBuzzerStatus);
     socket.on('buzzer:reset', onBuzzerReset);
     socket.on('buzzer:winner', onBuzzerWinner);
-    socket.on('buzzer:won', onBuzzerWinner);
+    socket.on('auth:error', onAuthError);
+    socket.on('question:shown', onQuestionShown);
+    socket.on('turn:updated', onTurnUpdated);
+    socket.on('rapid-fire:started', onRapidFireStarted);
+    socket.on('winner:celebration', onWinnerCelebration);
     socket.on('answer:locked', onAnswerLocked);
     socket.on('answer:evaluated', onAnswerEvaluated);
     socket.on('rapid-fire:tick', onRapidFireTick);
@@ -374,7 +438,11 @@ export default function AdminDashboard() {
       socket.off('buzzer:status', onBuzzerStatus);
       socket.off('buzzer:reset', onBuzzerReset);
       socket.off('buzzer:winner', onBuzzerWinner);
-      socket.off('buzzer:won', onBuzzerWinner);
+      socket.off('auth:error', onAuthError);
+      socket.off('question:shown', onQuestionShown);
+      socket.off('turn:updated', onTurnUpdated);
+      socket.off('rapid-fire:started', onRapidFireStarted);
+      socket.off('winner:celebration', onWinnerCelebration);
       socket.off('answer:locked', onAnswerLocked);
       socket.off('answer:evaluated', onAnswerEvaluated);
       socket.off('rapid-fire:tick', onRapidFireTick);
@@ -385,25 +453,43 @@ export default function AdminDashboard() {
     };
   }, [isAuthenticated]);
 
-  // Hotkey listener for Rapid Fire (Z: Correct, X: Wrong, C: Pass)
+  // Operator hotkeys (Modernize.md §5):
+  //   Rapid Fire: Z Correct, X Wrong, C Pass
+  //   Buzzer round: Space reveal next option, Enter 3-2-1 countdown, Escape reset buzzer
   useEffect(() => {
     function handleKeyDown(e) {
-      if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+      if (['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'].includes(e.target.tagName)) return;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.repeat) return;
 
       if (currentStage === 'ROUND_RAPID_FIRE' && rfState.isActive) {
-        if (e.key === 'z' || e.key === 'Z') {
-          handleRapidFireAction('CORRECT');
-        } else if (e.key === 'x' || e.key === 'X') {
-          handleRapidFireAction('WRONG');
-        } else if (e.key === 'c' || e.key === 'C') {
-          handleRapidFireAction('PASS');
+        const action = { z: 'CORRECT', x: 'WRONG', c: 'PASS' }[e.key.toLowerCase()];
+        if (action) {
+          e.preventDefault();
+          handleRapidFireAction(action);
+        }
+        return;
+      }
+
+      if (currentStage === 'ROUND_BUZZER' && activeQuestion && questionSubState.isQuestionVisible) {
+        if (e.key === ' ') {
+          e.preventDefault();
+          const nextHidden = (activeQuestion.options || []).findIndex(
+            (_, idx) => !questionSubState.revealedOptions?.includes(idx)
+          );
+          if (nextHidden !== -1) handleRevealOption(nextHidden);
+        } else if (e.key === 'Enter') {
+          e.preventDefault();
+          handleStartCountdown();
+        } else if (e.key === 'Escape') {
+          e.preventDefault();
+          handleResetBuzzer();
         }
       }
     }
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [currentStage, rfState, rfTeamId]);
+  }, [currentStage, rfState, activeQuestion, questionSubState]);
 
   // Stage Switch Handler
   const handleSetStage = (stage) => {
@@ -413,9 +499,9 @@ export default function AdminDashboard() {
     flashNotice(`Stage changed to ${stage}`);
   };
 
-  const flashNotice = (msg) => {
+  const flashNotice = (msg, durationMs = 3000) => {
     setActionNotice(msg);
-    setTimeout(() => setActionNotice(null), 3000);
+    setTimeout(() => setActionNotice((current) => (current === msg ? null : current)), durationMs);
   };
 
   // -------------------------------------------------------------
@@ -429,18 +515,8 @@ export default function AdminDashboard() {
 
     // CRITICAL: Reset question sub-state locally on question transition
     setQuestionSubState({
-      isQuestionVisible: true,
-      revealedOptions: [],
-      areAllOptionsVisible: false,
-      isCountdownActive: false,
-      hasCountdownStarted: false,
-      isCountdownDone: false,
-      isBuzzerOpen: false,
-      buzzerLockedBy: null,
-      selectedOptionIndex: null,
-      isAnswerLocked: false,
-      isEvaluated: false,
-      isCorrect: null
+      ...EMPTY_QUESTION_SUB_STATE,
+      isQuestionVisible: q.roundType !== 'AUDIO_VISUAL'
     });
 
     socket.emit('admin:load-question', {
@@ -498,20 +574,23 @@ export default function AdminDashboard() {
   const handleEvaluate = (isCorrect) => {
     if (!activeQuestion) return;
 
-    socket.emit('admin:evaluate', {
-      isCorrect,
-      points: activeQuestion.points || 10,
-      negativePoints: activeQuestion.negativePoints || 5,
-      correctOptionIndex: activeQuestion.correctOptionIndex,
-      teamId: questionSubState.buzzerLockedBy?.teamId
-    });
+    if (questionSubState.isEvaluated) {
+      flashNotice('This question has already been evaluated');
+      return;
+    }
 
-    flashNotice(isCorrect ? '✅ Marked Correct! Points granted.' : '❌ Marked Wrong! Penalty deducted.');
+    // Points and the answer key are applied by the server from the stored question
+    socket.emit('admin:evaluate', { isCorrect });
+
+    flashNotice(isCorrect ? '✅ Marked Correct! Points granted.' : '❌ Marked Wrong!');
   };
 
   const handleNextQuestion = () => {
     if (filteredBuzzerQuestions.length === 0) return;
-    const nextIdx = (currentQuestionIndex + 1) % filteredBuzzerQuestions.length;
+    const currentIdx = filteredBuzzerQuestions.findIndex(
+      (q) => activeQuestion && (q._id || q.id) === (activeQuestion._id || activeQuestion.id)
+    );
+    const nextIdx = (currentIdx + 1) % filteredBuzzerQuestions.length;
     handleSelectQuestion(filteredBuzzerQuestions[nextIdx], nextIdx);
   };
 
@@ -523,6 +602,11 @@ export default function AdminDashboard() {
   const handleMediaControl = (action) => {
     socket.emit('admin:media-control', { action });
     flashNotice(`Media command: ${action}`);
+  };
+
+  const handleShowAvQuestion = () => {
+    socket.emit('admin:show-question');
+    flashNotice('Question & options shown on stage');
   };
 
   const handleSetAvTurn = (teamId) => {
@@ -540,20 +624,22 @@ export default function AdminDashboard() {
     }
     const targetTeamId = rfTeamId || teams[0]?._id || teams[0]?.id;
 
+    if (!targetTeamId) {
+      flashNotice('Register a team first');
+      return;
+    }
+
     socket.emit('admin:rapid-fire-start', { teamId: targetTeamId, seconds: 60 });
-    setRfState({
-      isActive: true,
-      secondsRemaining: 60,
-      stats: { correct: 0, wrong: 0, pass: 0 }
-    });
     flashNotice('60-Second Rapid Fire timer started!');
   };
 
+  const handleStopRapidFire = () => {
+    socket.emit('admin:rapid-fire-stop');
+  };
+
+  // The server scores the team it started the clock for
   const handleRapidFireAction = (action) => {
-    socket.emit('admin:rapid-fire-action', {
-      action,
-      teamId: rfTeamId || teams[0]?._id || teams[0]?.id
-    });
+    socket.emit('admin:rapid-fire-action', { action });
   };
 
   // -------------------------------------------------------------
@@ -575,9 +661,8 @@ export default function AdminDashboard() {
   const handleResetEvent = async () => {
     if (!window.confirm('Reset all scores and return to Welcome screen?')) return;
     try {
-      const res = await fetch(`${API_URL}/api/v1/event/reset`, { method: 'POST' });
-      const json = await res.json();
-      if (json.success) {
+      const { json } = await adminFetch('/event/reset', { method: 'POST' });
+      if (json?.success) {
         loadInitialData();
         flashNotice('Event state reset to WELCOME');
       }
@@ -588,9 +673,8 @@ export default function AdminDashboard() {
 
   const handleSeedDemoData = async () => {
     try {
-      const res = await fetch(`${API_URL}/api/v1/event/seed`, { method: 'POST' });
-      const json = await res.json();
-      if (json.success) {
+      const { json } = await adminFetch('/event/seed', { method: 'POST' });
+      if (json?.success) {
         loadInitialData();
         flashNotice('Demo questions and teams re-seeded successfully!');
       }
@@ -602,9 +686,8 @@ export default function AdminDashboard() {
   // Force reset a team's active device session
   const handleForceResetSession = async (teamId) => {
     try {
-      const res = await fetch(`${API_URL}/api/v1/teams/${teamId}/reset-session`, { method: 'POST' });
-      const json = await res.json();
-      if (json.success) {
+      const { json } = await adminFetch(`/teams/${teamId}/reset-session`, { method: 'POST' });
+      if (json?.success) {
         loadInitialData();
         flashNotice('Team device session reset! They can log in on a new phone.');
       }
@@ -628,24 +711,22 @@ export default function AdminDashboard() {
     setIsCreatingTeam(true);
     setTeamFormError('');
     try {
-      const res = await fetch(`${API_URL}/api/v1/teams`, {
+      const { json } = await adminFetch('/teams', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+        body: {
           teamName: newTeamName.trim(),
           teamNumber: num,
           pin
-        })
+        }
       });
-      const json = await res.json();
-      if (json.success && json.data) {
+      if (json?.success && json.data) {
         setTeams((prev) => [...prev, json.data]);
         setNewTeamName('');
         setNewTeamNumber(String(num + 1));
         setNewTeamPin(String(1000 + num + 1));
         flashNotice(`Team "${json.data.teamName}" registered!`);
       } else {
-        setTeamFormError(json.error || json.message || 'Failed to register team');
+        setTeamFormError(json?.error || json?.message || 'Failed to register team');
       }
     } catch (err) {
       setTeamFormError('Network error registering team');
@@ -657,9 +738,8 @@ export default function AdminDashboard() {
   const handleDeleteTeam = async (teamId, teamName) => {
     if (!window.confirm(`Delete ${teamName}? This will remove all their scores.`)) return;
     try {
-      const res = await fetch(`${API_URL}/api/v1/teams/${teamId}`, { method: 'DELETE' });
-      const json = await res.json();
-      if (json.success) {
+      const { json } = await adminFetch(`/teams/${teamId}`, { method: 'DELETE' });
+      if (json?.success) {
         setTeams((prev) => prev.filter((t) => (t._id || t.id) !== teamId));
         flashNotice(`Team "${teamName}" deleted.`);
       }
@@ -747,12 +827,6 @@ export default function AdminDashboard() {
             </button>
           </form>
 
-          <div className="pt-2 border-t border-white/10 text-center">
-            <span className="text-[11px] text-slate-400">
-              Demo Credentials: <strong className="text-amber-300 font-mono">admin</strong> /{' '}
-              <strong className="text-amber-300 font-mono">admin123</strong>
-            </span>
-          </div>
         </div>
       </div>
     );
@@ -940,7 +1014,7 @@ export default function AdminDashboard() {
                       key={q._id || q.id}
                       onClick={() => handleSelectQuestion(q, idx)}
                       className={`px-4 py-2 rounded-xl text-xs font-bold shrink-0 transition-all ${
-                        currentQuestionIndex === idx
+                        activeQuestion && (activeQuestion._id || activeQuestion.id) === (q._id || q.id)
                           ? 'bg-[#583FA9] text-white shadow-lg glow-purple'
                           : 'bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white'
                       }`}
@@ -952,7 +1026,7 @@ export default function AdminDashboard() {
               </div>
 
               {/* Active Question Control Hub */}
-              {activeQuestion && (
+              {activeQuestion && activeQuestion.roundType === 'BUZZER' && (
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                   {/* Left Column: Question & Option Reveals */}
                   <div className="lg:col-span-2 glass-panel p-6 rounded-2xl space-y-6">
@@ -960,7 +1034,7 @@ export default function AdminDashboard() {
                       <div className="flex items-center justify-between text-xs text-slate-400">
                         <span>QUESTION #{currentQuestionIndex + 1}</span>
                         <span className="text-emerald-400 font-bold">
-                          +{activeQuestion.points || 10} / -{activeQuestion.negativePoints || 5} PTS
+                          +{activeQuestion.points ?? 10} / -{activeQuestion.negativePoints ?? 5} PTS
                         </span>
                       </div>
                       <h2 className="text-xl font-bold text-white font-heading">
@@ -1151,23 +1225,30 @@ export default function AdminDashboard() {
                       <div className="grid grid-cols-2 gap-3">
                         <button
                           onClick={() => handleEvaluate(true)}
-                          className="py-3.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm shadow-lg shadow-emerald-600/30 flex items-center justify-center gap-2 transition-all"
+                          disabled={!questionSubState.buzzerLockedBy || questionSubState.isEvaluated}
+                          className="py-3.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm shadow-lg shadow-emerald-600/30 flex items-center justify-center gap-2 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                         >
                           <Check className="w-4 h-4" />
-                          Correct (+10)
+                          Correct (+{activeQuestion.points ?? 10})
                         </button>
 
                         <button
                           onClick={() => handleEvaluate(false)}
-                          className="py-3.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-sm shadow-lg shadow-rose-600/30 flex items-center justify-center gap-2 transition-all"
+                          disabled={!questionSubState.buzzerLockedBy || questionSubState.isEvaluated}
+                          className="py-3.5 px-4 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-sm shadow-lg shadow-rose-600/30 flex items-center justify-center gap-2 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                         >
                           <X className="w-4 h-4" />
-                          Wrong (-5)
+                          Wrong (-{activeQuestion.negativePoints ?? 5})
                         </button>
                       </div>
 
                       <p className="text-[11px] text-slate-400 text-center italic">
-                        ⚠️ No-Reopen Rule: If wrong, question concludes immediately.
+                        {questionSubState.isEvaluated
+                          ? `Evaluated: ${questionSubState.isCorrect ? 'correct' : 'wrong'}. Move to the next question.`
+                          : '⚠️ No-Reopen Rule: If wrong, question concludes immediately.'}
+                      </p>
+                      <p className="text-[10px] text-slate-500 text-center font-mono">
+                        Hotkeys: Space reveal next option · Enter countdown · Esc reset buzzer
                       </p>
                     </div>
                   </div>
@@ -1190,6 +1271,31 @@ export default function AdminDashboard() {
                   <p className="text-xs text-slate-400">
                     Remote control stage video/audio playback and score turn-based teams.
                   </p>
+                </div>
+              </div>
+
+              {/* AV Question Selector (media-first) */}
+              <div className="p-6 rounded-2xl bg-white/5 border border-white/10 space-y-4">
+                <span className="text-xs font-bold uppercase tracking-wider text-sky-300 block">
+                  1. Load a clip on stage (question stays hidden until you show it):
+                </span>
+                <div className="flex gap-2 overflow-x-auto pb-1">
+                  {filteredAvQuestions.map((q, idx) => (
+                    <button
+                      key={q._id || q.id}
+                      onClick={() => handleSelectQuestion(q, idx)}
+                      className={`px-4 py-2 rounded-xl text-xs font-bold shrink-0 transition-all ${
+                        activeQuestion && (activeQuestion._id || activeQuestion.id) === (q._id || q.id)
+                          ? 'bg-sky-600 text-white shadow-lg'
+                          : 'bg-white/5 text-slate-400 hover:bg-white/10 hover:text-white'
+                      }`}
+                    >
+                      AV #{idx + 1} · {q.mediaType}
+                    </button>
+                  ))}
+                  {filteredAvQuestions.length === 0 && (
+                    <span className="text-xs text-slate-500">No audio-visual questions in the bank.</span>
+                  )}
                 </div>
               </div>
 
@@ -1220,13 +1326,27 @@ export default function AdminDashboard() {
                     <RotateCcw className="w-4 h-4" />
                     Replay from Start
                   </button>
+                  <button
+                    onClick={() => handleMediaControl('mute')}
+                    className="px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center gap-2 border border-slate-700"
+                  >
+                    <VolumeX className="w-4 h-4" />
+                    Mute
+                  </button>
+                  <button
+                    onClick={() => handleMediaControl('unmute')}
+                    className="px-5 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold flex items-center gap-2 border border-slate-700"
+                  >
+                    <Volume2 className="w-4 h-4" />
+                    Unmute
+                  </button>
                 </div>
               </div>
 
               {/* Turn-Based Team Rotation */}
               <div className="p-6 rounded-2xl bg-white/5 border border-white/10 space-y-4">
                 <span className="text-xs font-bold uppercase tracking-wider text-amber-300">
-                  Designate Active Team's Turn:
+                  2. Designate Active Team's Turn:
                 </span>
                 <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3">
                   {teams.map((t) => (
@@ -1244,6 +1364,58 @@ export default function AdminDashboard() {
                   ))}
                 </div>
               </div>
+
+              {/* Show Question & Evaluate */}
+              {activeQuestion && activeQuestion.roundType === 'AUDIO_VISUAL' && (
+                <div className="p-6 rounded-2xl bg-white/5 border border-white/10 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3">
+                    <span className="text-xs font-bold uppercase tracking-wider text-emerald-300">
+                      3. Question, answer key & verdict:
+                    </span>
+                    <button
+                      onClick={handleShowAvQuestion}
+                      disabled={questionSubState.isQuestionVisible}
+                      className="px-4 py-2 rounded-xl bg-[#583FA9] hover:bg-[#684ec2] text-white text-xs font-bold flex items-center gap-2 disabled:opacity-40"
+                    >
+                      <Eye className="w-4 h-4" />
+                      {questionSubState.isQuestionVisible ? 'Question Shown on Stage' : 'Show Question & Options'}
+                    </button>
+                  </div>
+
+                  <h4 className="text-base font-bold text-white">{activeQuestion.questionText}</h4>
+                  <div className="text-sm text-emerald-300 font-bold">
+                    Answer: Option {String.fromCharCode(65 + (activeQuestion.correctOptionIndex ?? 0))} —{' '}
+                    {activeQuestion.options?.[activeQuestion.correctOptionIndex]?.text || 'N/A'}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <button
+                      onClick={() => handleEvaluate(true)}
+                      disabled={!avActiveTeamId || questionSubState.isEvaluated}
+                      className="py-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      <Check className="w-4 h-4" />
+                      Correct (+{activeQuestion.points ?? 15})
+                    </button>
+                    <button
+                      onClick={() => handleEvaluate(false)}
+                      disabled={!avActiveTeamId || questionSubState.isEvaluated}
+                      className="py-3 rounded-xl bg-rose-600 hover:bg-rose-500 text-white font-bold text-sm flex items-center justify-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
+                    >
+                      <X className="w-4 h-4" />
+                      Wrong ({activeQuestion.negativePoints ? `-${activeQuestion.negativePoints}` : '0'})
+                    </button>
+                  </div>
+                  {!avActiveTeamId && (
+                    <p className="text-[11px] text-amber-300 text-center">Designate the team whose turn it is before scoring.</p>
+                  )}
+                  {questionSubState.isEvaluated && (
+                    <p className="text-[11px] text-slate-400 text-center">
+                      Evaluated: {questionSubState.isCorrect ? 'correct' : 'wrong'}. Load the next clip.
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -1290,16 +1462,41 @@ export default function AdminDashboard() {
                   </select>
                 </div>
 
-                <div className="pt-5">
+                <div className="pt-5 flex gap-2">
+                  {rfState.isActive && (
+                    <button
+                      onClick={handleStopRapidFire}
+                      className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-sm border border-slate-700"
+                    >
+                      Stop Clock
+                    </button>
+                  )}
                   <button
                     onClick={handleStartRapidFire}
-                    className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-rose-600 to-amber-600 hover:opacity-95 text-white font-bold text-sm shadow-lg shadow-rose-600/30 flex items-center gap-2"
+                    disabled={rfState.isActive}
+                    className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-rose-600 to-amber-600 hover:opacity-95 text-white font-bold text-sm shadow-lg shadow-rose-600/30 flex items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed"
                   >
                     <Play className="w-4 h-4 fill-white" />
                     Start 60s Rapid Fire Clock
                   </button>
                 </div>
               </div>
+
+              {/* Current question (host view, with answer) */}
+              {activeQuestion && activeQuestion.roundType === 'RAPID_FIRE' && (
+                <div className="p-5 rounded-2xl bg-white/5 border border-white/10 space-y-2">
+                  <div className="flex items-center justify-between text-xs text-slate-400">
+                    <span>NOW ON STAGE</span>
+                    <span className="font-mono-numbers">
+                      ✓ {rfState.stats.correct} · ✗ {rfState.stats.wrong} · ↷ {rfState.stats.pass}
+                    </span>
+                  </div>
+                  <h4 className="text-lg font-bold text-white">{activeQuestion.questionText}</h4>
+                  <div className="text-sm text-emerald-300 font-bold">
+                    Answer: {activeQuestion.options?.[activeQuestion.correctOptionIndex]?.text || 'N/A'}
+                  </div>
+                </div>
+              )}
 
               {/* 3 GIANT TOUCH / HOTKEY ACCELERATOR PADS */}
               <div className="grid grid-cols-3 gap-4 pt-4">

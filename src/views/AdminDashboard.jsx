@@ -131,6 +131,8 @@ export default function AdminDashboard() {
 
   // AV Round Turn Selection
   const [avActiveTeamId, setAvActiveTeamId] = useState('');
+  // Question ids whose clip file is missing from the backend's public/media folder
+  const [missingMediaIds, setMissingMediaIds] = useState([]);
 
   // Rapid Fire State
   const [rfTeamId, setRfTeamId] = useState('');
@@ -241,6 +243,11 @@ export default function AdminDashboard() {
       const questionsRes = await adminFetch('/questions');
       if (questionsRes.json?.success && Array.isArray(questionsRes.json.data)) {
         setQuestions(questionsRes.json.data);
+      }
+
+      const mediaRes = await adminFetch('/media');
+      if (mediaRes.json?.success) {
+        setMissingMediaIds((mediaRes.json.data.missing || []).map((m) => m.questionId));
       }
     } catch (err) {
       console.error('Failed to load initial admin state:', err);
@@ -1291,6 +1298,11 @@ export default function AdminDashboard() {
                       }`}
                     >
                       AV #{idx + 1} · {q.mediaType}
+                      {missingMediaIds.includes(String(q._id || q.id)) && (
+                        <span className="ml-1.5 text-rose-300" title={`${q.mediaUrl} is not in the backend's public/media folder`}>
+                          ⚠ file missing
+                        </span>
+                      )}
                     </button>
                   ))}
                   {filteredAvQuestions.length === 0 && (

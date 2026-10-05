@@ -28,3 +28,14 @@ export async function apiFetch(path, { method = 'GET', body, token } = {}) {
   } catch (err) {}
   return { ok: res.ok, status: res.status, json };
 }
+
+/**
+ * URL for an audio-visual clip. Clips live in the backend's public/media
+ * folder, so a question's "/media/clip.mp4" is loaded from the backend;
+ * full http(s) URLs are used as-is.
+ */
+export function mediaSrc(mediaUrl) {
+  if (!mediaUrl) return '';
+  if (/^(https?:|data:|blob:)/i.test(mediaUrl)) return mediaUrl;
+  return `${API_URL}${mediaUrl.startsWith('/') ? '' : '/'}${mediaUrl}`;
+}

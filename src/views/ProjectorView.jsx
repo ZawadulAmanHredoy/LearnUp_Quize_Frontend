@@ -33,7 +33,7 @@ import soundEngine, {
 import { triggerConfetti } from '../lib/confetti';
 
 import QRCode from 'qrcode';
-import { apiFetch } from '../lib/config';
+import { apiFetch, mediaSrc } from '../lib/config';
 
 function statsFromServer(stats) {
   return {
@@ -873,8 +873,10 @@ export default function ProjectorView() {
                   >
                     <video
                       ref={mediaRef}
-                      src={activeQuestion.mediaUrl}
+                      src={mediaSrc(activeQuestion.mediaUrl)}
                       controls={false}
+                      preload="auto"
+                      playsInline
                       className="w-full h-full object-contain"
                     />
                   </div>
@@ -888,7 +890,21 @@ export default function ProjectorView() {
                     <span className="text-sm font-bold text-sky-200 uppercase tracking-widest">
                       Audio Clue Playback
                     </span>
-                    <audio ref={mediaRef} src={activeQuestion.mediaUrl} controls={false} />
+                    <audio ref={mediaRef} src={mediaSrc(activeQuestion.mediaUrl)} controls={false} preload="auto" />
+                  </div>
+                )}
+
+                {activeQuestion.mediaType === 'IMAGE' && activeQuestion.mediaUrl && (
+                  <div
+                    className={`rounded-2xl overflow-hidden bg-black/40 mx-auto border border-white/20 shadow-2xl flex items-center justify-center transition-all duration-500 ${
+                      questionSubState.isQuestionVisible ? 'max-h-[260px]' : 'max-h-[560px]'
+                    }`}
+                  >
+                    <img
+                      src={mediaSrc(activeQuestion.mediaUrl)}
+                      alt="Visual clue"
+                      className={`object-contain ${questionSubState.isQuestionVisible ? 'max-h-[260px]' : 'max-h-[560px]'}`}
+                    />
                   </div>
                 )}
 

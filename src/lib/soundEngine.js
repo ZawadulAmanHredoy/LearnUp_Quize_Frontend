@@ -33,6 +33,11 @@ export function toggleMute() {
   return isMuted;
 }
 
+export function setMuted(val) {
+  isMuted = Boolean(val);
+  return isMuted;
+}
+
 export function getMuteStatus() {
   return isMuted;
 }

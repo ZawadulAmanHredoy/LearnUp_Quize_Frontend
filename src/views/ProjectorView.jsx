@@ -34,6 +34,7 @@ import { triggerConfetti } from '../lib/confetti';
 
 import QRCode from 'qrcode';
 import { apiFetch, mediaSrc } from '../lib/config';
+import { preloadMedia, subscribeMediaStatus, getPlayableUrl } from '../lib/mediaCache';
 
 function statsFromServer(stats) {
   return {
@@ -104,6 +105,61 @@ export default function ProjectorView() {
 
   // Media Player Ref for AV Round
   const mediaRef = useRef(null);
+
+  // Local copies of the AV clips (downloaded ahead of the round)
+  const [mediaStatus, setMediaStatus] = useState({ ready: 0, total: 0, running: false, items: {} });
+  const [mediaSource, setMediaSource] = useState(null);
+
+  // Report download progress to the admin (throttled)
+  useEffect(() => {
+    let timer = null;
+    let latest = null;
+    const send = () => {
+      timer = null;
+      if (latest) socket.emit('projector:media-status', latest);
+    };
+    const unsubscribe = subscribeMediaStatus((status) => {
+      setMediaStatus(status);
+      latest = status;
+      if (!status.running) {
+        clearTimeout(timer);
+        send();
+      } else if (!timer) {
+        timer = setTimeout(send, 500);
+      }
+    });
+    return () => {
+      clearTimeout(timer);
+      unsubscribe();
+    };
+  }, []);
+
+  // Play the active clip from the local copy when present (no buffering)
+  const activeMediaId = activeQuestion?.mediaId || null;
+  const activeMediaUrl = activeQuestion?.mediaUrl || null;
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl = null;
+    setMediaSource(null);
+
+    if (activeMediaId) {
+      getPlayableUrl(activeMediaId).then((source) => {
+        if (cancelled) {
+          if (source.isLocal) URL.revokeObjectURL(source.url);
+          return;
+        }
+        if (source.isLocal) objectUrl = source.url;
+        setMediaSource(source);
+      });
+    } else if (activeMediaUrl) {
+      setMediaSource({ url: mediaSrc({ mediaUrl: activeMediaUrl }), isLocal: false });
+    }
+
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [activeMediaId, activeMediaUrl]);
 
   // Score banner auto-hides so it never lingers into the next screen
   const evaluationBannerTimer = useRef(null);
@@ -215,6 +271,16 @@ export default function ProjectorView() {
         playFanfare();
         triggerConfetti({ durationMs: 8000, particleCount: 200 });
       }
+    }
+
+    // Clip list for the AV round: download anything not stored locally yet
+    function onMediaManifest(manifest) {
+      preloadMedia(manifest);
+    }
+
+    // Admin logged in or asked for a re-download
+    function onMediaPreload(manifest) {
+      preloadMedia(manifest, { force: Boolean(manifest?.force) });
     }
 
     function onTurnUpdated(data) {
@@ -407,6 +473,8 @@ export default function ProjectorView() {
     socket.on('countdown:tick', onCountdownTick);
     socket.on('buzzer:winner', onBuzzerWinner);
     socket.on('winner:celebration', onWinnerCelebration);
+    socket.on('media:manifest', onMediaManifest);
+    socket.on('media:preload', onMediaPreload);
     socket.on('buzzer:reset', onBuzzerReset);
     socket.on('turn:updated', onTurnUpdated);
     socket.on('question:shown', onQuestionShown);
@@ -429,6 +497,8 @@ export default function ProjectorView() {
       socket.off('countdown:tick', onCountdownTick);
       socket.off('buzzer:winner', onBuzzerWinner);
       socket.off('winner:celebration', onWinnerCelebration);
+      socket.off('media:manifest', onMediaManifest);
+      socket.off('media:preload', onMediaPreload);
       socket.off('buzzer:reset', onBuzzerReset);
       socket.off('turn:updated', onTurnUpdated);
       socket.off('question:shown', onQuestionShown);
@@ -865,7 +935,7 @@ export default function ProjectorView() {
                 </div>
 
                 {/* Media Presentation Display */}
-                {activeQuestion.mediaType === 'VIDEO' && activeQuestion.mediaUrl && (
+                {activeQuestion.mediaType === 'VIDEO' && mediaSource && (
                   <div
                     className={`rounded-2xl overflow-hidden bg-black aspect-video mx-auto border border-white/20 shadow-2xl relative transition-all duration-500 ${
                       questionSubState.isQuestionVisible ? 'max-h-[240px]' : 'max-h-[520px]'
@@ -873,7 +943,7 @@ export default function ProjectorView() {
                   >
                     <video
                       ref={mediaRef}
-                      src={mediaSrc(activeQuestion.mediaUrl)}
+                      src={mediaSource?.url}
                       controls={false}
                       preload="auto"
                       playsInline
@@ -882,7 +952,7 @@ export default function ProjectorView() {
                   </div>
                 )}
 
-                {activeQuestion.mediaType === 'AUDIO' && activeQuestion.mediaUrl && (
+                {activeQuestion.mediaType === 'AUDIO' && mediaSource && (
                   <div className="p-8 rounded-2xl bg-black/40 border border-white/10 flex flex-col items-center justify-center space-y-4">
                     <div className="w-16 h-16 rounded-full bg-[#0EA5E9]/20 text-[#0EA5E9] flex items-center justify-center animate-pulse">
                       <Volume2 className="w-8 h-8" />
@@ -890,18 +960,18 @@ export default function ProjectorView() {
                     <span className="text-sm font-bold text-sky-200 uppercase tracking-widest">
                       Audio Clue Playback
                     </span>
-                    <audio ref={mediaRef} src={mediaSrc(activeQuestion.mediaUrl)} controls={false} preload="auto" />
+                    <audio ref={mediaRef} src={mediaSource?.url} controls={false} preload="auto" />
                   </div>
                 )}
 
-                {activeQuestion.mediaType === 'IMAGE' && activeQuestion.mediaUrl && (
+                {activeQuestion.mediaType === 'IMAGE' && mediaSource && (
                   <div
                     className={`rounded-2xl overflow-hidden bg-black/40 mx-auto border border-white/20 shadow-2xl flex items-center justify-center transition-all duration-500 ${
                       questionSubState.isQuestionVisible ? 'max-h-[260px]' : 'max-h-[560px]'
                     }`}
                   >
                     <img
-                      src={mediaSrc(activeQuestion.mediaUrl)}
+                      src={mediaSource?.url}
                       alt="Visual clue"
                       className={`object-contain ${questionSubState.isQuestionVisible ? 'max-h-[260px]' : 'max-h-[560px]'}`}
                     />
@@ -1193,8 +1263,14 @@ export default function ProjectorView() {
       {/* 3. BOTTOM FOOTER BAR                                          */}
       {/* ------------------------------------------------------------- */}
       <footer className="relative z-10 px-8 py-4 border-t border-white/10 bg-[#160D2E]/80 backdrop-blur-md flex items-center justify-between text-xs text-slate-400">
-        <div>
-          LearnUp Live Stage Engine • High Contrast TV Presentation Mode
+        <div className="flex items-center gap-4">
+          <span>LearnUp Live Stage Engine • High Contrast TV Presentation Mode</span>
+          {mediaStatus.total > 0 && mediaStatus.ready < mediaStatus.total && (
+            <span className="px-2 py-0.5 rounded-md bg-sky-500/10 text-sky-300 border border-sky-500/20">
+              Preparing clips {mediaStatus.ready}/{mediaStatus.total}
+              {mediaStatus.bytesTotal > 0 && ` · ${Math.round((mediaStatus.bytesDone / mediaStatus.bytesTotal) * 100)}%`}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-3">
           <button

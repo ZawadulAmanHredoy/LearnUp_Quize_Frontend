@@ -39,6 +39,8 @@ import {
 import { socket } from '../lib/socket';
 
 import { apiFetch } from '../lib/config';
+import { preloadMedia, subscribeMediaStatus } from '../lib/mediaCache';
+import QuestionBankManager from './QuestionBankManager';
 
 const EMPTY_QUESTION_SUB_STATE = {
   isQuestionVisible: false,
@@ -131,8 +133,11 @@ export default function AdminDashboard() {
 
   // AV Round Turn Selection
   const [avActiveTeamId, setAvActiveTeamId] = useState('');
-  // Question ids whose clip file is missing from the backend's public/media folder
-  const [missingMediaIds, setMissingMediaIds] = useState([]);
+  // AV clips: the list the round needs, this browser's local copies, and
+  // each connected projector's download progress
+  const [mediaManifest, setMediaManifest] = useState({ items: [], totalBytes: 0 });
+  const [localMedia, setLocalMedia] = useState({ ready: 0, total: 0, running: false, items: {} });
+  const [projectorMedia, setProjectorMedia] = useState([]);
 
   // Rapid Fire State
   const [rfTeamId, setRfTeamId] = useState('');
@@ -207,6 +212,11 @@ export default function AdminDashboard() {
     return result;
   };
 
+  const reloadQuestions = async () => {
+    const { json } = await adminFetch('/questions');
+    if (json?.success && Array.isArray(json.data)) setQuestions(json.data);
+  };
+
   const applySnapshot = (data) => {
     if (!data) return;
     const state = data.state;
@@ -245,10 +255,7 @@ export default function AdminDashboard() {
         setQuestions(questionsRes.json.data);
       }
 
-      const mediaRes = await adminFetch('/media');
-      if (mediaRes.json?.success) {
-        setMissingMediaIds((mediaRes.json.data.missing || []).map((m) => m.questionId));
-      }
+
     } catch (err) {
       console.error('Failed to load initial admin state:', err);
     }
@@ -261,6 +268,9 @@ export default function AdminDashboard() {
 
     function onConnect() {
       socket.emit('join:room', { role: 'admin', token: localStorage.getItem('admin_token') });
+      // Logging in starts the clip downloads: this browser downloads them
+      // (on media:manifest below) and every projector is told to as well
+      socket.emit('admin:media-preload');
     }
 
     if (socket.connected) {
@@ -274,6 +284,19 @@ export default function AdminDashboard() {
 
     function onStateSync(data) {
       applySnapshot(data);
+    }
+
+    function onMediaManifest(manifest) {
+      setMediaManifest(manifest || { items: [], totalBytes: 0 });
+      preloadMedia(manifest);
+    }
+
+    function onProjectorMedia(statuses) {
+      setProjectorMedia(Array.isArray(statuses) ? statuses : []);
+    }
+
+    function onQuestionsUpdated(list) {
+      if (Array.isArray(list)) setQuestions(list);
     }
 
     function onAuthError(data) {
@@ -422,6 +445,9 @@ export default function AdminDashboard() {
     socket.on('buzzer:reset', onBuzzerReset);
     socket.on('buzzer:winner', onBuzzerWinner);
     socket.on('auth:error', onAuthError);
+    socket.on('media:manifest', onMediaManifest);
+    socket.on('media:projector-status', onProjectorMedia);
+    socket.on('questions:updated', onQuestionsUpdated);
     socket.on('question:shown', onQuestionShown);
     socket.on('turn:updated', onTurnUpdated);
     socket.on('rapid-fire:started', onRapidFireStarted);
@@ -446,6 +472,9 @@ export default function AdminDashboard() {
       socket.off('buzzer:reset', onBuzzerReset);
       socket.off('buzzer:winner', onBuzzerWinner);
       socket.off('auth:error', onAuthError);
+      socket.off('media:manifest', onMediaManifest);
+      socket.off('media:projector-status', onProjectorMedia);
+      socket.off('questions:updated', onQuestionsUpdated);
       socket.off('question:shown', onQuestionShown);
       socket.off('turn:updated', onTurnUpdated);
       socket.off('rapid-fire:started', onRapidFireStarted);
@@ -459,6 +488,31 @@ export default function AdminDashboard() {
       socket.off('admin:notice', onAdminNotice);
     };
   }, [isAuthenticated]);
+
+  useEffect(() => subscribeMediaStatus(setLocalMedia), []);
+
+  // A clip is safe to play when every connected projector has it stored
+  // (or, with no projector connected, when this browser has it)
+  const clipReadyOnProjector = (mediaId) => {
+    if (!mediaId) return true;
+    if (projectorMedia.length === 0) return localMedia.items[mediaId] === 'ready';
+    return projectorMedia.every((p) => p.items?.[mediaId] === 'ready');
+  };
+
+  const mediaSummary = (() => {
+    const total = mediaManifest.items.length;
+    const localReady = mediaManifest.items.filter((item) => localMedia.items[item.id] === 'ready').length;
+    const projectorReady = mediaManifest.items.filter((item) =>
+      projectorMedia.length > 0 && projectorMedia.every((p) => p.items?.[item.id] === 'ready')
+    ).length;
+    return { total, localReady, projectorReady, allReady: total > 0 && projectorReady === total };
+  })();
+
+  const handleRedownloadMedia = () => {
+    preloadMedia(mediaManifest, { force: true });
+    socket.emit('admin:media-preload', { force: true });
+    flashNotice('Re-downloading all clips on this laptop and the projector');
+  };
 
   // Operator hotkeys (Modernize.md §5):
   //   Rapid Fire: Z Correct, X Wrong, C Pass
@@ -517,6 +571,12 @@ export default function AdminDashboard() {
   const filteredBuzzerQuestions = questions.filter((q) => q.roundType === 'BUZZER');
 
   const handleSelectQuestion = (q, idx) => {
+    if (q.roundType === 'AUDIO_VISUAL' && q.mediaId && !clipReadyOnProjector(q.mediaId)) {
+      const ok = window.confirm(
+        'This clip is still downloading on the projector, so it may buffer if played now. Put it on stage anyway?'
+      );
+      if (!ok) return;
+    }
     setActiveQuestion(q);
     setCurrentQuestionIndex(idx);
 
@@ -876,6 +936,27 @@ export default function AdminDashboard() {
             <Tv className="w-3.5 h-3.5" />
             <span>Projector: {radar.isProjectorConnected ? 'Connected (Live)' : 'Offline'}</span>
           </div>
+
+          {/* AV Clip Downloads */}
+          {mediaSummary.total > 0 && (
+            <div
+              title={`This laptop: ${mediaSummary.localReady}/${mediaSummary.total} · Projector: ${
+                projectorMedia.length ? `${mediaSummary.projectorReady}/${mediaSummary.total}` : 'not connected'
+              }`}
+              className={`px-3 py-1.5 rounded-xl border text-xs flex items-center gap-2 ${
+                mediaSummary.allReady
+                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                  : 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+              }`}
+            >
+              <Play className="w-3.5 h-3.5" />
+              <span>
+                Clips: {projectorMedia.length ? `projector ${mediaSummary.projectorReady}/${mediaSummary.total}` : `laptop ${mediaSummary.localReady}/${mediaSummary.total}`}
+                {localMedia.running && localMedia.bytesTotal > 0 &&
+                  ` · ${Math.round((localMedia.bytesDone / localMedia.bytesTotal) * 100)}%`}
+              </span>
+            </div>
+          )}
 
           {/* Teams Online Radar */}
           <div className="px-3 py-1.5 rounded-xl bg-purple-500/10 border border-purple-500/30 text-purple-300 text-xs flex items-center gap-2">
@@ -1298,16 +1379,27 @@ export default function AdminDashboard() {
                       }`}
                     >
                       AV #{idx + 1} · {q.mediaType}
-                      {missingMediaIds.includes(String(q._id || q.id)) && (
-                        <span className="ml-1.5 text-rose-300" title={`${q.mediaUrl} is not in the backend's public/media folder`}>
-                          ⚠ file missing
-                        </span>
-                      )}
+                      <span className="ml-1.5" title="Downloaded on the projector?">
+                        {clipReadyOnProjector(q.mediaId) ? '✅' : '⏳'}
+                      </span>
                     </button>
                   ))}
                   {filteredAvQuestions.length === 0 && (
                     <span className="text-xs text-slate-500">No audio-visual questions in the bank.</span>
                   )}
+                </div>
+                <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
+                  <span>
+                    Clips downloaded — this laptop: {mediaSummary.localReady}/{mediaSummary.total} · projector:{' '}
+                    {projectorMedia.length ? `${mediaSummary.projectorReady}/${mediaSummary.total}` : 'not connected'}
+                    {mediaSummary.allReady && ' · ✅ ready to play without buffering'}
+                  </span>
+                  <button
+                    onClick={handleRedownloadMedia}
+                    className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-slate-300 font-semibold"
+                  >
+                    Re-download clips
+                  </button>
                 </div>
               </div>
 
@@ -1809,84 +1901,17 @@ export default function AdminDashboard() {
       )}
 
       {/* ------------------------------------------------------------- */}
-      {/* 4. MODALS: QUESTION BANK (SERVED FROM CODEBASE VIA API)        */}
+      {/* 4. QUESTION BANK EDITOR (create / edit / order / upload media) */}
       {/* ------------------------------------------------------------- */}
       {showQuestionModal && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-6">
-          <div className="max-w-3xl w-full glass-panel p-6 rounded-3xl space-y-4 max-h-[85vh] flex flex-col">
-            <div className="flex items-center justify-between pb-3 border-b border-white/10">
-              <div>
-                <h3 className="text-base font-bold text-white flex items-center gap-2">
-                  <Sliders className="w-4 h-4 text-purple-400" />
-                  Codebase Question Bank ({questions.length} Questions)
-                </h3>
-                <p className="text-xs text-slate-400">
-                  Questions and media assets are loaded from the codebase repository and served via API.
-                </p>
-              </div>
-              <button
-                onClick={() => setShowQuestionModal(false)}
-                className="w-8 h-8 rounded-lg bg-white/10 flex items-center justify-center text-slate-400 hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <div className="flex-1 overflow-y-auto space-y-3 pr-1">
-              {questions.map((q, idx) => (
-                <div
-                  key={q._id || q.id}
-                  className="p-4 rounded-xl bg-white/5 border border-white/10 space-y-2.5"
-                >
-                  <div className="flex items-center justify-between text-xs">
-                    <div className="flex items-center gap-2">
-                      <span className="px-2 py-0.5 rounded-md bg-[#583FA9]/40 text-[#E0D7FE] font-bold">
-                        {q.roundType}
-                      </span>
-                      {q.mediaType && q.mediaType !== 'NONE' && (
-                        <span className="px-2 py-0.5 rounded-md bg-sky-500/20 text-sky-300 font-bold border border-sky-500/30">
-                          {q.mediaType}: {q.mediaUrl}
-                        </span>
-                      )}
-                    </div>
-                    <span className="text-slate-400">Question #{q.order || idx + 1}</span>
-                  </div>
-
-                  <p className="text-sm font-semibold text-white">{q.questionText}</p>
-
-                  {/* Options List with Correct Answer Highlight */}
-                  {q.options && q.options.length > 0 && (
-                    <div className="grid grid-cols-2 gap-2 pt-1 text-xs">
-                      {q.options.map((opt, oIdx) => {
-                        const isCorrect = q.correctOptionIndex === oIdx;
-                        return (
-                          <div
-                            key={oIdx}
-                            className={`p-2 rounded-lg border ${
-                              isCorrect
-                                ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-300 font-bold'
-                                : 'bg-white/5 border-white/5 text-slate-400'
-                            }`}
-                          >
-                            <span className="font-bold mr-1.5">{opt.label}:</span>
-                            <span>{opt.text}</span>
-                            {isCorrect && <span className="ml-1 text-emerald-400 font-extrabold">✓ (Correct)</span>}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-
-                  {q.explanation && (
-                    <p className="text-[11px] text-slate-400 italic pt-1 border-t border-white/5">
-                      💡 {q.explanation}
-                    </p>
-                  )}
-                </div>
-              ))}
-            </div>
-          </div>
-        </div>
+        <QuestionBankManager
+          questions={questions}
+          activeQuestionId={activeQuestion?._id}
+          adminFetch={adminFetch}
+          onClose={() => setShowQuestionModal(false)}
+          onChanged={reloadQuestions}
+          flashNotice={flashNotice}
+        />
       )}
     </div>
   );

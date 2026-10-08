@@ -32,10 +32,14 @@ The frontend will run at `http://localhost:5173` and on the LAN at `http://<lapt
 | Screen | URL | Notes |
 | :--- | :--- | :--- |
 | Admin | `/admin` | Log in with the backend's admin account. Refreshing restores the exact live state. |
-| Projector | `/projector` | Click **Enter Fullscreen Stage Mode** once (unlocks sound). The welcome screen shows a QR code with the join address. |
-| Team phones | `/buzzer` | Team number + PIN. One phone per team; logging in on another phone closes the first. |
+| Projector | `/live` (or `/projector`) | Click anywhere once to unlock sound, then use the **Fullscreen** button in the footer. The welcome screen (title, subtitle, badge, QR code, team list) is edited from the admin's Welcome deck. |
+| Team phones | `/buzzer` | Team ID (e.g. `T-01`) or team number + PIN. One phone per team; logging in on another phone closes the first. |
 
-**Question Bank:** in the admin sidebar, open **Questions Bank** to create, edit, delete and reorder questions for each round, upload clips for the audio-visual round (with preview), and export/import the bank as JSON.
+The admin dashboard shows a live 16:9 preview of the stage. It is only a preview: the **Projector** badge in the header turns green only when a real projector screen is connected.
+
+**Teams and scores:** register teams (name, Team ID, number, institution, team lead, PIN) from **Teams**. Scores can be corrected from the leaderboard deck: quick +/- buttons, or **Manual Score Override** to set each round's score.
+
+**Question Bank:** in the admin sidebar, open **Questions Bank** to create, edit, delete and reorder questions for each round, upload clips for the audio-visual round (with preview), and export/import the bank as JSON. **Upload CSV** adds the questions in a spreadsheet to the selected round (download **Sample CSV** for the columns; questions already in the round are skipped). For audio-visual rows the *Media File* column names a clip that is already in the media library, so upload the clips first. **Delete Round** clears one round and keeps the others.
 
 **Clips play without buffering:** logging in as admin downloads every audio-visual clip into the browser's local storage (IndexedDB) and tells every connected projector to do the same. The projector plays its local copy. Watch **Clips: projector N/N** in the admin header and wait for it to be complete before Round 2. A projector tab in the same browser as the admin shares the downloaded clips.
 
